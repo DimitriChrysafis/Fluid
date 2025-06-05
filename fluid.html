@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PBF2D with Gravity Toggle</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #2E8B57;
+      font-family: Arial, sans-serif;
+    }
+    canvas {
+      display: block;
+    }
+    #overlayCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      pointer-events: none;
+      z-index: 5;
+    }
+    #gravToggle {
+      display: none;
+    }
+    #gravLabel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      width: 80px;
+      height: 30px;
+      line-height: 30px;
+      text-align: center;
+      color: #fff;
+      font-weight: bold;
+      border-radius: 4px;
+      cursor: pointer;
+      background-color: red;
+    }
+    #gravToggle:checked + #gravLabel {
+      background-color: green;
+    }
+    #gravLabel span {
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <input type="checkbox" id="gravToggle" checked>
+  <label id="gravLabel" for="gravToggle"><span>CLICK-ME-TO-TOGGLE-GRAVITY</span></label>
+  <canvas id="canvas"></canvas>
+  <canvas id="overlayCanvas"></canvas>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const octx = overlayCanvas.getContext('2d');
+    let worldWidth = 80.0;
+    let worldHeight = 40.0;
+    let cellSize = 2.51;
+    let cellRecpr = 1.0 / cellSize;
+    function roundUp(f, s) {
+      return (Math.floor((f * cellRecpr) / s) + 1) * s;
+    }
+    let gridSize = {
+      x: roundUp(worldWidth, 1),
+      y: roundUp(worldHeight, 1)
+    };
+    let gridCellCount = gridSize.x * gridSize.y;
+    let grid2Particles = new Array(gridCellCount).fill().map(() => []);
+    let maxNeighbors = 100;
+    let timeDelta = 0.05;
+    let gravityConstant = -9.8;
+    let gravityEnabled = document.getElementById('gravToggle').checked;
+    let particleRadiusPixels = 4.0;
+    let particleRadiusWorld = particleRadiusPixels / 10.0;
+    let h = 1.1;
+    let rho0 = 1.0;
+    let lambdaEpsilon = 100.0;
+    let pbfNumIters = 5;
+    let corrDeltaQCoeff = 0.3;
+    let corrK = 0.001;
+    let neighborRadius = h * 1.05;
+    const poly6Factor = (315.0 / 64.0) / Math.PI;
+    const spikyGradFactor = -45.0 / Math.PI;
+    let positions = [];
+    let oldPositions = [];
+    let velocities = [];
+    let lambdas = [];
+    let positionDeltas = [];
+    let neighbors = [];
+    const initialCols = 100;
+    const initialCount = initialCols * 20;
+    function initParticles() {
+      const delta = h * 0.3;
+      const cols = initialCols;
+      const offsX = (worldWidth - delta * cols) * 0.5;
+      const offsY = worldHeight * 0.02;
+      for (let i = 0; i < initialCount; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const px = col * delta + offsX;
+        const py = row * delta + offsY;
+        positions.push({ x: px, y: py });
+        oldPositions.push({ x: px, y: py });
+        velocities.push({
+          x: (Math.random() - 0.5) * 4.0,
+          y: (Math.random() - 0.5) * 4.0
+        });
+        lambdas.push(0.0);
+        positionDeltas.push({ x: 0.0, y: 0.0 });
+        neighbors.push([]);
+      }
+    }
+    function confinePositionToBoundary(pos) {
+      const bmin = particleRadiusWorld;
+      const bmaxX = worldWidth - particleRadiusWorld;
+      const bmaxY = worldHeight - particleRadiusWorld;
+      if (pos.x <= bmin) pos.x = bmin + Math.random() * 1e-5;
+      else if (pos.x >= bmaxX) pos.x = bmaxX - Math.random() * 1e-5;
+      if (pos.y <= bmin) pos.y = bmin + Math.random() * 1e-5;
+      else if (pos.y >= bmaxY) pos.y = bmaxY - Math.random() * 1e-5;
+      return pos;
+    }
+    function poly6Value(rLen) {
+      if (rLen <= 0 || rLen >= h) return 0.0;
+      const x = (h * h - rLen * rLen) / (h * h * h);
+      return poly6Factor * x * x * x;
+    }
+    function spikyGradient(rVec) {
+      const rx = rVec.x, ry = rVec.y;
+      const rLen = Math.hypot(rx, ry);
+      if (rLen <= 0 || rLen >= h) return { x: 0, y: 0 };
+      const x = (h - rLen) / (h * h * h);
+      const gFactor = spikyGradFactor * x * x;
+      return {
+        x: (rx * gFactor) / rLen,
+        y: (ry * gFactor) / rLen
+      };
+    }
+    function computeSCorr(rVec) {
+      const rLen = Math.hypot(rVec.x, rVec.y);
+      const num = poly6Value(rLen);
+      const den = poly6Value(corrDeltaQCoeff * h);
+      if (den === 0) return 0.0;
+      let x = num / den;
+      x = x * x;
+      x = x * x;
+      return -corrK * x;
+    }
+    function getCell(pos) {
+      return {
+        i: Math.floor(pos.x * cellRecpr),
+        j: Math.floor(pos.y * cellRecpr)
+      };
+    }
+    function isInGrid(i, j) {
+      return i >= 0 && i < gridSize.x && j >= 0 && j < gridSize.y;
+    }
+    function cellToIndex(i, j) {
+      return i + j * gridSize.x;
+    }
+    function buildGrid() {
+      for (let c = 0; c < gridCellCount; c++) {
+        grid2Particles[c].length = 0;
+      }
+      for (let p = 0; p < positions.length; p++) {
+        const pos = positions[p];
+        const cell = getCell(pos);
+        if (isInGrid(cell.i, cell.j)) {
+          const idx = cellToIndex(cell.i, cell.j);
+          grid2Particles[idx].push(p);
+        }
+      }
+    }
+    function findNeighbors() {
+      for (let i = 0; i < positions.length; i++) {
+        neighbors[i].length = 0;
+        const posI = positions[i];
+        const cell = getCell(posI);
+        for (let di = -1; di <= 1; di++) {
+          for (let dj = -1; dj <= 1; dj++) {
+            const ni = cell.i + di;
+            const nj = cell.j + dj;
+            if (!isInGrid(ni, nj)) continue;
+            const cellIdx = cellToIndex(ni, nj);
+            const plist = grid2Particles[cellIdx];
+            for (let k = 0; k < plist.length; k++) {
+              const j = plist[k];
+              if (j === i) continue;
+              if (neighbors[i].length >= maxNeighbors) break;
+              const dx = posI.x - positions[j].x;
+              const dy = posI.y - positions[j].y;
+              if (dx * dx + dy * dy < neighborRadius * neighborRadius) {
+                neighbors[i].push(j);
+              }
+            }
+          }
+        }
+      }
+    }
+    function prologue() {
+      for (let i = 0; i < positions.length; i++) {
+        oldPositions[i].x = positions[i].x;
+        oldPositions[i].y = positions[i].y;
+        if (gravityEnabled) {
+          velocities[i].y += gravityConstant * timeDelta;
+        }
+        positions[i].x += velocities[i].x * timeDelta;
+        positions[i].y += velocities[i].y * timeDelta;
+        const confined = confinePositionToBoundary(positions[i]);
+        positions[i].x = confined.x;
+        positions[i].y = confined.y;
+      }
+      buildGrid();
+      findNeighbors();
+    }
+    function substep() {
+      for (let i = 0; i < positions.length; i++) {
+        const posI = positions[i];
+        let gradIx = 0.0, gradIy = 0.0;
+        let sumGradSqr = 0.0;
+        let densityConstraint = -3.0;
+        const nbrs = neighbors[i];
+        for (let idx = 0; idx < nbrs.length; idx++) {
+          const j = nbrs[idx];
+          const posJ = positions[j];
+          const rx = posI.x - posJ.x;
+          const ry = posI.y - posJ.y;
+          const gradJ = spikyGradient({ x: rx, y: ry });
+          gradIx += gradJ.x;
+          gradIy += gradJ.y;
+          sumGradSqr += gradJ.x * gradJ.x + gradJ.y * gradJ.y;
+          densityConstraint += poly6Value(Math.hypot(rx, ry));
+        }
+        densityConstraint = (1.0 * densityConstraint / rho0) - 1.0;
+        sumGradSqr += gradIx * gradIx + gradIy * gradIy;
+        lambdas[i] = -densityConstraint / (sumGradSqr + lambdaEpsilon);
+      }
+      for (let i = 0; i < positions.length; i++) {
+        const posI = positions[i];
+        const λi = lambdas[i];
+        let dpx = 0.0, dpy = 0.0;
+        const nbrs = neighbors[i];
+        for (let idx = 0; idx < nbrs.length; idx++) {
+          const j = nbrs[idx];
+          const λj = lambdas[j];
+          const posJ = positions[j];
+          const rx = posI.x - posJ.x;
+          const ry = posI.y - posJ.y;
+          const scorr = computeSCorr({ x: rx, y: ry });
+          const gradW = spikyGradient({ x: rx, y: ry });
+          const scalar = λi + λj + scorr;
+          dpx += scalar * gradW.x;
+          dpy += scalar * gradW.y;
+        }
+        positionDeltas[i].x = dpx / rho0;
+        positionDeltas[i].y = dpy / rho0;
+      }
+      for (let i = 0; i < positions.length; i++) {
+        positions[i].x += positionDeltas[i].x;
+        positions[i].y += positionDeltas[i].y;
+      }
+    }
+    function epilogue() {
+      for (let i = 0; i < positions.length; i++) {
+        const confined = confinePositionToBoundary(positions[i]);
+        positions[i].x = confined.x;
+        positions[i].y = confined.y;
+        velocities[i].x = (positions[i].x - oldPositions[i].x) / timeDelta;
+        velocities[i].y = (positions[i].y - oldPositions[i].y) / timeDelta;
+      }
+      cleanParticles();
+    }
+    function runPBF() {
+      prologue();
+      for (let it = 0; it < pbfNumIters; it++) {
+        substep();
+      }
+      epilogue();
+    }
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      overlayCanvas.width = window.innerWidth;
+      overlayCanvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+    function screenToWorld(mouseX, mouseY) {
+      const worldX = (mouseX / canvas.width) * worldWidth;
+      const worldY = ((canvas.height - mouseY) / canvas.height) * worldHeight;
+      return { x: worldX, y: worldY };
+    }
+    let dragging = false;
+    let dragStart = { x: 0, y: 0 };
+    let dragEnd = { x: 0, y: 0 };
+    canvas.addEventListener('mousedown', (e) => {
+      dragging = true;
+      dragStart.x = e.clientX;
+      dragStart.y = e.clientY;
+      dragEnd.x = e.clientX;
+      dragEnd.y = e.clientY;
+    });
+    canvas.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      dragEnd.x = e.clientX;
+      dragEnd.y = e.clientY;
+      drawOverlayRectangle();
+    });
+    canvas.addEventListener('mouseup', (e) => {
+      if (!dragging) return;
+      dragging = false;
+      dragEnd.x = e.clientX;
+      dragEnd.y = e.clientY;
+      clearOverlay();
+      spawnParticlesInRect();
+    });
+    canvas.addEventListener('mouseleave', () => {
+      if (dragging) {
+        dragging = false;
+        clearOverlay();
+        spawnParticlesInRect();
+      }
+    });
+    function drawOverlayRectangle() {
+      octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+      const x = Math.min(dragStart.x, dragEnd.x);
+      const y = Math.min(dragStart.y, dragEnd.y);
+      const w = Math.abs(dragEnd.x - dragStart.x);
+      const hgt = Math.abs(dragEnd.y - dragStart.y);
+      octx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+      octx.fillRect(x, y, w, hgt);
+      octx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+      octx.lineWidth = 2;
+      octx.strokeRect(x, y, w, hgt);
+    }
+    function clearOverlay() {
+      octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+    }
+    function spawnParticlesInRect() {
+      const worldA = screenToWorld(dragStart.x, dragStart.y);
+      const worldB = screenToWorld(dragEnd.x, dragEnd.y);
+      const minX = Math.min(worldA.x, worldB.x);
+      const maxX = Math.max(worldA.x, worldB.x);
+      const minY = Math.min(worldA.y, worldB.y);
+      const maxY = Math.max(worldA.y, worldB.y);
+      const delta = h * 0.8;
+      const startX = minX + delta * 0.5;
+      const startY = minY + delta * 0.5;
+      for (let wx = startX; wx <= maxX; wx += delta) {
+        for (let wy = startY; wy <= maxY; wy += delta) {
+          if (wx >= minX - 1e-6 && wx <= maxX + 1e-6 && wy >= minY - 1e-6 && wy <= maxY + 1e-6) {
+            positions.push({ x: wx, y: wy });
+            oldPositions.push({ x: wx, y: wy });
+            velocities.push({ x: 0.0, y: 0.0 });
+            lambdas.push(0.0);
+            positionDeltas.push({ x: 0.0, y: 0.0 });
+            neighbors.push([]);
+          }
+        }
+      }
+    }
+    function cleanParticles() {
+      if (positions.length <= 3000) return;
+      const keepAboveBottom = [];
+      for (let i = 0; i < positions.length; i++) {
+        if (positions[i].y > particleRadiusWorld + 1e-6) {
+          keepAboveBottom.push(i);
+        }
+      }
+      if (keepAboveBottom.length > 3000) {
+        keepAboveBottom.sort((a, b) => positions[b].y - positions[a].y);
+        keepAboveBottom.length = 3000;
+      }
+      const newPositions = [];
+      const newOldPositions = [];
+      const newVelocities = [];
+      const newLambdas = [];
+      const newPositionDeltas = [];
+      const newNeighbors = [];
+      for (let idx of keepAboveBottom) {
+        newPositions.push(positions[idx]);
+        newOldPositions.push(oldPositions[idx]);
+        newVelocities.push(velocities[idx]);
+        newLambdas.push(lambdas[idx]);
+        newPositionDeltas.push(positionDeltas[idx]);
+        newNeighbors.push([]);
+      }
+      positions = newPositions;
+      oldPositions = newOldPositions;
+      velocities = newVelocities;
+      lambdas = newLambdas;
+      positionDeltas = newPositionDeltas;
+      neighbors = newNeighbors;
+    }
+    function render() {
+      ctx.fillStyle = '#2E8B57';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+	   ctx.save();
+  ctx.font = 'bold 60px Arial';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('Click and drag to spawn balls', canvas.width / 2, canvas.height * 0.1);
+  ctx.restore();
+
+      const scaleX = canvas.width / worldWidth;
+      const scaleY = canvas.height / worldHeight;
+      for (let i = 0; i < positions.length; i++) {
+        const vx = velocities[i].x;
+        const vy = velocities[i].y;
+        const speed = Math.hypot(vx, vy);
+        const normalized = Math.min(speed / 5.0, 1.0);
+        const red = Math.floor(normalized * 255);
+        const blue = Math.floor((1 - normalized) * 255);
+        ctx.fillStyle = `rgb(${red}, 0, ${blue})`;
+        const sx = positions[i].x * scaleX;
+        const sy = canvas.height - positions[i].y * scaleY;
+        ctx.beginPath();
+        ctx.arc(sx, sy, particleRadiusPixels, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+    function animate() {
+      runPBF();
+      render();
+      requestAnimationFrame(animate);
+    }
+    initParticles();
+    requestAnimationFrame(animate);
+    document.getElementById('gravToggle').addEventListener('change', (e) => {
+      gravityEnabled = e.target.checked;
+    });
+  </script>
+</body>
+</html>
